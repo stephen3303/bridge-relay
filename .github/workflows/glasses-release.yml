@@ -1,0 +1,100 @@
+# Dev release of the Bridge iPhone app for sideloading: builds the personal flavour unsigned on a
+# GitHub-hosted Mac and publishes GlassesRelay.ipa as a prerelease (tag bridge-dev-<run number>).
+# Re-sign and install it from Windows with Sideloadly or AltStore; steps are in glasses/SIDELOAD.md,
+# which is also the release notes.
+# Run it from Actions > Glasses dev release > Run workflow on main. A push that edits this file (or a
+# run on another branch) builds without publishing, so changes to the workflow get checked on their PR.
+name: Glasses dev release
+on:
+  workflow_dispatch:
+  push:
+    paths: [".github/workflows/glasses-release.yml"]
+
+# Read-only by default: only the publish job, which runs no third-party build tooling, can write.
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: glasses/ios
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Use newest Xcode (toolkit needs 26.4+)
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Generate Xcode project
+        run: |
+          brew install xcodegen xcbeautify
+          xcodegen generate
+
+      - name: Build unsigned device app
+        env:
+          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}   # crash reports (ErrorReporting.swift); empty means off
+        run: |
+          set -o pipefail
+          xcodebuild -project GlassesRelay.xcodeproj -scheme GlassesRelay \
+            -sdk iphoneos -configuration Release -derivedDataPath build \
+            -skipPackagePluginValidation -skipMacroValidation \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CURRENT_PROJECT_VERSION=${{ github.run_number }} \
+            SENTRY_DSN="$SENTRY_DSN" build | xcbeautify --renderer github-actions
+
+      # Symbols, so crash reports show function names and lines. Skipped without the token; never fails the release.
+      - name: Upload symbols to Sentry
+        if: github.event_name == 'workflow_dispatch'
+        continue-on-error: true
+        env:
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+          SENTRY_ORG: ${{ vars.SENTRY_ORG }}
+          SENTRY_PROJECT: ${{ vars.SENTRY_PROJECT }}
+        run: |
+          if [ -z "$SENTRY_AUTH_TOKEN" ]; then echo "No SENTRY_AUTH_TOKEN secret; skipping."; exit 0; fi
+          npx --yes @sentry/cli@2.58.6 debug-files upload --include-sources build/Build/Products/Release-iphoneos
+
+      - name: Package IPA
+        run: |
+          mkdir -p Payload
+          cp -R build/Build/Products/Release-iphoneos/GlassesRelay.app Payload/
+          zip -qry GlassesRelay.ipa Payload
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: GlassesRelay-dev-ipa
+          path: glasses/ios/GlassesRelay.ipa
+
+  publish:
+    needs: build
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          sparse-checkout: glasses/SIDELOAD.md
+          sparse-checkout-cone-mode: false
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: GlassesRelay-dev-ipa
+
+      - name: Publish prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: bridge-dev-${{ github.run_number }}
+        run: |
+          {
+            echo "Dev build ${{ github.run_number }} of Bridge (personal flavour), from \`${GITHUB_SHA::7}\` on \`${GITHUB_REF_NAME}\`."
+            echo
+            cat glasses/SIDELOAD.md
+          } > notes.md
+          gh release create "$TAG" GlassesRelay.ipa --prerelease --target "$GITHUB_SHA" \
+            --title "Bridge dev build ${{ github.run_number }}" --notes-file notes.md
